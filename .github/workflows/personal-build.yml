@@ -1,0 +1,191 @@
+name: Personal Build
+
+# Builds this fork's personal branch (a snapshot of upstream main) into
+# installers, so merged-but-unreleased work is usable before upstream cuts a
+# release. nightly-build.yml is hard-gated to the upstream repository and is
+# skipped on forks, so this is the fork's own build.
+
+# Push-triggered: `workflow_dispatch` would require this file to live on the
+# fork's default branch, which tracks upstream.
+on:
+  push:
+    branches:
+      - personal/main
+  workflow_dispatch:
+
+permissions:
+  contents: write # publish the installers as a release
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v6
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: '.node-version'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+
+      - name: Cache pnpm dependencies
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
+      - name: Install Dependencies
+        run: pnpm install
+
+      # x64 nsis only: this is a personal build, so the portable variant and the
+      # other architectures are dead weight.
+      - name: Build Windows installer
+        run: pnpm run build && npx electron-builder --win nsis --x64 --publish never
+        env:
+          ELECTRON_BUILDER_7Z_FILTER: BCJ
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_OPTIONS: --max-old-space-size=8192
+          # Absent on a fork; the bundled integrations that need them simply stay
+          # unconfigured, which is fine for personal use.
+          MAIN_VITE_CHERRYAI_CLIENT_SECRET: ${{ secrets.MAIN_VITE_CHERRYAI_CLIENT_SECRET }}
+          MAIN_VITE_MINERU_API_KEY: ${{ secrets.MAIN_VITE_MINERU_API_KEY }}
+          RENDERER_VITE_AIHUBMIX_SECRET: ${{ secrets.RENDERER_VITE_AIHUBMIX_SECRET }}
+          RENDERER_VITE_PPIO_APP_SECRET: ${{ secrets.RENDERER_VITE_PPIO_APP_SECRET }}
+
+      # `feat` marks this as the patched build, so a downloaded file is never
+      # mistaken for an official one. Staged outside `out/`, which is already
+      # electron-vite's build output and would be swept into the artifact.
+      - name: Rename installer
+        shell: bash
+        run: |
+          version=$(node -p "require('./package.json').version")
+          mkdir -p installers
+          find dist -maxdepth 1 -name '*-x64-setup.exe' -exec cp {} "installers/Cherry-Studio-${version}-feat-x64-setup.exe" \;
+          ls -lh installers
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-windows
+          path: installers/*
+          if-no-files-found: error
+          retention-days: 30
+
+  build-linux:
+    runs-on: ubuntu-latest
+    # Build the deb inside Debian rather than on the Ubuntu runner: the runner's
+    # glibc is newer, and binaries linked against it fail to start on Debian and
+    # older Ubuntu releases.
+    container: debian:12
+
+    steps:
+      # The image is bare, so everything the native modules link against has to
+      # be installed first: tar/unzip/zip unpack the bundled binaries (bun ships
+      # as a zip), selection-hook links against X11/Xtst/Xfixes/evdev/wayland,
+      # and electron-builder needs fakeroot and dpkg to assemble the .deb.
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential python3 git curl ca-certificates \
+            tar unzip zip xz-utils \
+            fakeroot dpkg-dev \
+            libx11-dev libxtst-dev libxfixes-dev libevdev-dev libwayland-dev
+
+      - name: Check out Git repository
+        uses: actions/checkout@v6
+
+      # Inside the container the checkout is owned by a different uid than the
+      # one running the build, so git refuses to touch it. `pnpm install`'s
+      # prepare script writes a local git config and dies on that.
+      - name: Trust the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: '.node-version'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+
+      - name: Install Dependencies
+        run: pnpm install
+
+      - name: Build Linux deb
+        run: pnpm run build && npx electron-builder --linux deb --x64 --publish never
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_OPTIONS: --max-old-space-size=8192
+          MAIN_VITE_CHERRYAI_CLIENT_SECRET: ${{ secrets.MAIN_VITE_CHERRYAI_CLIENT_SECRET }}
+          MAIN_VITE_MINERU_API_KEY: ${{ secrets.MAIN_VITE_MINERU_API_KEY }}
+          RENDERER_VITE_AIHUBMIX_SECRET: ${{ secrets.RENDERER_VITE_AIHUBMIX_SECRET }}
+          RENDERER_VITE_PPIO_APP_SECRET: ${{ secrets.RENDERER_VITE_PPIO_APP_SECRET }}
+
+      - name: Rename installer
+        run: |
+          version=$(node -p "require('./package.json').version")
+          mkdir -p installers
+          find dist -maxdepth 1 -name '*.deb' -exec cp {} "installers/Cherry-Studio-${version}-feat-amd64.deb" \;
+          ls -lh installers
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-linux
+          path: installers/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v6
+
+      - name: Download installers
+        uses: actions/download-artifact@v4
+        with:
+          path: installers
+          merge-multiple: true
+
+      # Artifacts expire after 30 days and download as a zip behind a login. A
+      # release keeps a stable, directly downloadable link.
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(node -p "require('./package.json').version")
+          tag="personal-$(date +'%Y%m%d')-${GITHUB_SHA::7}"
+          cat > notes.md <<NOTES
+          Cherry Studio ${version}, built from upstream \`main\` ahead of an official
+          release, so merged work is usable now — including mini app split view
+          (PR #18425) and sidebar pin for assistants and agents (PR #18345).
+
+          Built from \`$GITHUB_SHA\`. The deb is built inside Debian 12 for glibc
+          compatibility.
+
+          Installs over the official build and shares its data: same appId, so logins,
+          pinned mini apps and chat history all carry over.
+
+          Auto-update will replace this build with the next official release.
+          NOTES
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Personal build $(date +'%Y%m%d') ($version)" \
+            --notes-file notes.md \
+            installers/*
